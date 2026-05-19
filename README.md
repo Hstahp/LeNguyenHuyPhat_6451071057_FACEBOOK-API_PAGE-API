@@ -1,169 +1,146 @@
-# Facebook Page API Backend (Node.js)
+# Facebook Page API & Webhook Processing System (Microservices)
 
-Backend Node.js (Express) de goi Facebook Graph API cho Facebook Page.
+Hệ thống quản lý bài viết, phân tích chỉ số và tự động phản hồi sự kiện từ Facebook Page sử dụng kiến trúc **Microservices (Node.js/Express)**, giao tiếp qua **Kafka** và lưu trữ dữ liệu trên **PostgreSQL**.
 
-## 1) Phan 1 - Chuan bi (can chup screenshot)
+---
 
-### A. Tao Facebook Page
-1. Vao Facebook > Pages > Create new Page.
-2. Dat ten Page, category, thong tin co ban.
-3. Sau khi tao xong, vao `About` de lay Page ID.
+## ⚙️ Sơ đồ kiến trúc & luồng dữ liệu
 
-Screenshot can nop:
-- Page da tao (hien ten Page)
-- Page ID
+```mermaid
+graph TD
+    %% Định nghĩa các Actor & Bên thứ ba
+    FB[Facebook Graph API] -- Gửi Webhook Event --> WS[webhook-service:3001]
+    
+    %% Webhook service xử lý
+    WS -- Xác thực chữ ký & Đẩy Event --> K_RAW[Kafka Topic: raw_events]
+    
+    %% Core Service xử lý AI
+    K_RAW -- Consume --> CS[core-service:3002]
+    CS -- Phân tích AI & Sentiment --> K_PROCESSED[Kafka Topic: processed_events]
+    CS -- Sinh phản hồi tự động --> K_REPLY[Kafka Topic: reply_commands]
+    CS -- Sự kiện cần duyệt tay --> K_REVIEW[Kafka Topic: manual_review]
+    
+    %% Backend API xử lý
+    K_REPLY -- Consume & Gọi FB gửi phản hồi --> FB
+    
+    %% Luồng REST API của Admin Dashboard
+    Admin[Dashboard Admin] -- Gọi REST API --> BE[backend-api:3000]
+    BE -- Xem Posts/Insights/Likes --> FB
+    BE -- Đọc/Ghi cơ sở dữ liệu --> DB[(PostgreSQL)]
+    
+    %% Luồng Retry Logic
+    BE -- Gửi FB thất bại --> K_FAILED[Kafka Topic: send_failed]
+    K_FAILED -- Consume --> RS[retry-service:3003]
+    RS -- Exponential Backoff --> K_RETRY[Kafka Topic: send_retry]
+    K_RETRY -- Thử lại --> BE
+    RS -- Quá số lần thử --> K_DLQ[Kafka Topic: dead_letter]
+```
 
-### B. Tao Facebook App (Meta for Developers)
-1. Vao: https://developers.facebook.com/
-2. My Apps > Create App.
-3. Chon loai app phu hop (thong thuong Business).
-4. Them san pham "Facebook Login" hoac cac product can dung cho Graph API.
+---
 
-Screenshot can nop:
-- Dashboard cua app (App Name + App ID)
+## 📁 Cấu trúc thư mục dự án
 
-### C. Lay Page Access Token
-1. Vao Graph API Explorer: https://developers.facebook.com/tools/explorer/
-2. Chon app vua tao.
-3. Lay User Access Token voi cac quyen can thiet (co the can app review voi quyen nang cao).
-4. Doi sang Page Access Token cho page cua ban.
+```text
+.
+├── fb_api/                  # Cấu hình hạ tầng Docker (Kafka, Zookeeper, Postgres, Prometheus...)
+├── services/
+│   ├── backend-api/         # REST API Admin Dashboard, tích hợp Facebook Graph & Database
+│   ├── webhook-service/     # Nhận và xác thực Webhook từ Facebook, đẩy vào Kafka
+│   ├── core-service/        # Phân tích cảm xúc (Sentiment) bằng Groq AI & sinh phản hồi tự động
+│   └── retry-service/       # Xử lý hàng đợi lỗi và cơ chế tự động thử lại (Retry)
+├── package.json             # Scripts quản lý khởi chạy toàn bộ hệ thống
+└── README.md
+```
 
-Quyen thuong dung:
-- pages_show_list
-- pages_read_engagement
-- pages_read_user_content
-- pages_manage_posts
-- pages_manage_engagement
-- read_insights
+---
 
-Screenshot can nop:
-- Token (co the che bot mot phan token cho an toan)
-- Danh sach permissions da cap
+## 🛠️ Quy ước cổng (Port) và Môi trường
 
-## 2) Cai dat backend
+Mỗi microservice tự quản lý cấu hình và file `.env` độc lập. Bạn cần copy file `.env.example` thành `.env` tại thư mục của từng service trước khi chạy:
 
-### Yeu cau
-- Node.js 18+
+| Service | Port mặc định | Thư mục cấu hình | File môi trường |
+| :--- | :---: | :--- | :--- |
+| **backend-api** | `3000` | `services/backend-api/` | `.env.example` -> `.env` |
+| **webhook-service** | `3001` | `services/webhook-service/` | `.env.example` -> `.env` |
+| **core-service** | `3002` | `services/core-service/` | `.env.example` -> `.env` |
+| **retry-service** | `3003` | `services/retry-service/` | `.env.example` -> `.env` |
 
-### Cai dat
-```bash
+---
+
+## 🚀 Hướng dẫn khởi chạy dự án
+
+### Cách 1: Khởi chạy bằng Docker Compose (Khuyên dùng)
+Bạn có thể chạy toàn bộ hệ thống (bao gồm cả Kafka, Postgres, Prometheus và các Microservices) chỉ với 1 câu lệnh duy nhất từ thư mục gốc:
+
+```powershell
+# Khởi động toàn bộ hạ tầng và các services
+npm run docker:up
+
+# Xem log thời gian thực của các container
+npm run docker:logs
+
+# Dừng hệ thống và giải phóng tài nguyên
+npm run docker:down
+```
+
+### Cách 2: Khởi chạy Local từng phần bằng Node.js
+
+#### 1. Khởi chạy hạ tầng trước (Database & Message Broker)
+Dùng Docker để chạy nhanh Kafka và Postgres local:
+```powershell
+# Chạy Kafka container độc lập
+docker run -d --name kafka -p 9092:9092 apache/kafka:latest
+```
+
+#### 2. Cài đặt dependency & khởi chạy các dịch vụ
+Tại thư mục gốc, chạy lệnh để cài đặt các package cho tất cả service:
+```powershell
+# Cài đặt tại root và các services tương ứng
 npm install
 ```
 
-Tao file `.env` tu `.env.example`:
-```env
-PORT=3000
-GRAPH_API_VERSION=v20.0
-PAGE_ACCESS_TOKEN=your_page_access_token_here
-DEFAULT_INSIGHTS_METRICS=page_impressions,page_post_engagements,page_fans
+Sau đó, mở các tab terminal riêng biệt và chạy các lệnh start tương ứng:
+```powershell
+# Chạy Webhook Service (Port 3001)
+npm run start:webhook
+
+# Chạy Backend API (Port 3000)
+npm run start:backend
+
+# Chạy Core Service (Port 3002)
+npm run start:core
+
+# Chạy Retry Service (Port 3003)
+npm run start:retry
 ```
 
-Chay server:
-```bash
-npm run dev
-```
-hoac
-```bash
-npm start
-```
+---
 
-## Swagger API Docs
+## 📖 Swagger API Documentation
 
-Sau khi chay server, mo Swagger UI tai:
+Sau khi `backend-api` khởi chạy, tài liệu đặc tả API và giao diện thử nghiệm Swagger UI có sẵn tại:
+👉 **Swagger UI:** `http://localhost:3000/api-docs`
 
-- http://localhost:3000/api-docs
+Các API chính được cung cấp:
+- **`GET /api/page/{pageId}`**: Lấy thông tin chi tiết Page.
+- **`GET /api/page/{pageId}/posts`**: Lấy danh sách bài viết.
+- **`POST /api/page/{pageId}/posts`**: Đăng bài viết mới lên Page.
+- **`DELETE /api/page/post/{postId}`**: Xóa bài viết.
+- **`GET /api/page/post/{postId}/comments`**: Lấy danh sách comments của bài viết.
+- **`GET /api/page/post/{postId}/likes`**: Lấy danh sách lượt thích của bài viết.
+- **`GET /api/page/{pageId}/insights`**: Lấy báo cáo chỉ số tương tác (engaged users, impressions, fans...).
 
-Raw OpenAPI JSON:
+---
 
-- http://localhost:3000/api-docs.json
+## 🔗 Đăng ký Webhook trên Facebook Developers
 
-Luu y khi test tren Swagger:
-- Co the truyen `access_token` tren query cho tung endpoint.
-- Neu da dat `PAGE_ACCESS_TOKEN` trong `.env`, ban khong can nhap token moi lan goi API.
-
-## 3) API da xay dung
-
-Base URL mac dinh: `http://localhost:3000`
-
-### 1. GET /api/page/{pageId}
-Lay thong tin page.
-
-Vi du:
-```bash
-curl "http://localhost:3000/api/page/{pageId}"
-```
-
-### 2. GET /api/page/{pageId}/posts
-Lay danh sach post cua page.
-
-Vi du:
-```bash
-curl "http://localhost:3000/api/page/{pageId}/posts?limit=5"
-```
-
-### 3. POST /api/page/{pageId}/posts
-Dang bai moi len page.
-
-Body JSON:
-```json
-{
-  "message": "Hello from API",
-  "link": "https://example.com"
-}
-```
-
-Vi du:
-```bash
-curl -X POST "http://localhost:3000/api/page/{pageId}/posts" \
-  -H "Content-Type: application/json" \
-  -d "{\"message\":\"Hello from API\"}"
-```
-
-### 4. DELETE /api/page/post/{postId}
-Xoa bai viet theo postId.
-
-Vi du:
-```bash
-curl -X DELETE "http://localhost:3000/api/page/post/{postId}"
-```
-
-### 5. GET /api/page/post/{postId}/comments
-Lay comments cua bai viet.
-
-Vi du:
-```bash
-curl "http://localhost:3000/api/page/post/{postId}/comments?limit=10"
-```
-
-### 6. GET /api/page/post/{postId}/likes
-Lay likes cua bai viet.
-
-Vi du:
-```bash
-curl "http://localhost:3000/api/page/post/{postId}/likes?limit=10"
-```
-
-### 7. GET /api/page/{pageId}/insights
-Lay insights cua page.
-
-Vi du:
-```bash
-curl "http://localhost:3000/api/page/{pageId}/insights?period=day"
-```
-
-## 4) Truyen access token
-
-Ung dung uu tien lay token theo thu tu:
-1. Query: `access_token`
-2. Header: `x-page-access-token`
-3. Bien moi truong: `PAGE_ACCESS_TOKEN`
-
-Vi du query token:
-```bash
-curl "http://localhost:3000/api/page/{pageId}?access_token=EAAB..."
-```
-
-## 5) Luu y
-- Mot so quyen can App Review de dung tren production.
-- Trong che do development, token thuong chi dung duoc voi vai tro admin/developer/tester.
-- Khong commit token that len git.
+1. Tạo App trên trang [Meta for Developers](https://developers.facebook.com/).
+2. Thêm sản phẩm **Webhooks** vào App của bạn.
+3. Sử dụng **ngrok** để expose port 3001 của `webhook-service` ra môi trường internet:
+   ```bash
+   ngrok http 3001
+   ```
+4. Copy link URL HTTPS từ ngrok và dán vào **Callback URL** của Facebook Webhook theo định dạng:
+   `https://<ngrok-subdomain>.ngrok-free.app/webhook`
+5. Nhập **Verify Token** trùng khớp với cấu hình `FACEBOOK_WEBHOOK_VERIFY_TOKEN` trong `.env` của `webhook-service`.
+6. Đăng ký nhận sự kiện (Subscribe) cho đối tượng **Page** với các trường cần giám sát (ví dụ: `feed`, `messages`).
