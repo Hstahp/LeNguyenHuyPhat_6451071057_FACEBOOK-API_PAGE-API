@@ -59,6 +59,12 @@ async function processEvent(event) {
     return;
   }
 
+  // Prevent infinite reply loops (Page replying to its own comment)
+  if (event.senderId && event.pageId && String(event.senderId) === String(event.pageId)) {
+    logger.info(`[SKIP] Comment is from the Page itself (${event.pageId}) — ignoring to prevent loop`);
+    return;
+  }
+
   // 4. Spam detection
   const spam = spamDetector.detect(event);
   if (spam.isSpam) {
